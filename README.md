@@ -140,8 +140,11 @@ las jugadas, capturas, ganador y marcador A/B. No modifica los modelos.
 ### Guardar, reanudar y evaluar
 
 `latest.pt` contiene red, optimizador, buffer y estados aleatorios. Se reemplaza
-de forma atómica al completar una iteración. `Ctrl+C` conserva el último
-checkpoint completo; el trabajo parcial de la iteración se repite al reanudar.
+de forma atómica cada 10 iteraciones por defecto y al terminar normalmente
+por límite de tiempo o iteraciones. `--checkpoint-every 50` cambia la frecuencia
+a 50; se puede indicar también al reanudar. Se crea un checkpoint inicial en
+la iteración 0. `Ctrl+C` conserva el último checkpoint guardado y descarta todo
+el trabajo posterior a ese guardado, incluso iteraciones completas sin guardar.
 Los pesos históricos `model_00005.pt`, etc., sirven para evaluación y se guardan
 cada intervalo de evaluación. Solo `latest.pt` permite reanudar entrenamiento.
 

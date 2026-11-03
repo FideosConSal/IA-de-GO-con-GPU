@@ -49,12 +49,16 @@ def parser():
     p.add_argument('--batch-wait-ms', type=float, default=2, help='Maximum wait to group inference requests')
     p.add_argument('--eval-every', type=int, default=5)
     p.add_argument('--eval-games', type=int, default=20)
+    p.add_argument('--checkpoint-every', type=int, default=10,
+                   help='Save latest.pt every N iterations and on normal completion')
     return p
 
 
 def main():
     p = parser()
     args = p.parse_args()
+    if args.checkpoint_every < 1:
+        p.error('--checkpoint-every must be positive')
     if args.workers < 1 or args.inference_batch_size < 1 or not math.isfinite(args.batch_wait_ms) or args.batch_wait_ms < 0:
         p.error('Invalid workers, inference batch size or wait')
     config_keys = ('size', 'channels', 'blocks', 'simulations', 'games_per_iteration',
@@ -110,6 +114,7 @@ def main():
     print(f'Device: {device}; Atari Go {args.size}x{args.size}; starting iteration {iteration}', flush=True)
     print(f'Initial position: {args.initial_position}', flush=True)
     runtime = dict(workers=args.workers, threads=args.threads,
+                   checkpoint_every=args.checkpoint_every,
                    active_workers=min(args.workers, args.games_per_iteration),
                    inference_batch_size=args.inference_batch_size, batch_wait_ms=args.batch_wait_ms,
                    device=str(device))
@@ -117,7 +122,9 @@ def main():
     (args.output / 'runtime.json').write_text(json.dumps(runtime, indent=2), encoding='utf-8')
     if args.workers > args.games_per_iteration:
         print('Workers capped by games-per-iteration; increase games in a new run to use more.', flush=True)
-    print('Ctrl+C stops; resume from the last completed iteration.', flush=True)
+    print(f'latest.pt every {args.checkpoint_every} iterations and on normal completion. '
+          'Ctrl+C resumes from the last saved checkpoint.', flush=True)
+    last_saved_iteration = iteration
     pool = None
     try:
         if args.workers > 1:
@@ -156,15 +163,23 @@ def main():
                            games_per_hour=args.games_per_iteration * 3600 / play_seconds,
                            iteration_seconds=time.perf_counter() - round_start,
                            elapsed_seconds=elapsed)
-            save_checkpoint(latest, model, optimizer, replay, rng, config, iteration, elapsed)
+            if iteration % args.checkpoint_every == 0:
+                save_checkpoint(latest, model, optimizer, replay, rng, config, iteration, elapsed)
+                last_saved_iteration = iteration
             if iteration % args.eval_every == 0:
                 torch.save({'config': config, 'model': model.state_dict(), 'iteration': iteration},
                            args.output / f'model_{iteration:05d}.pt')
             with (args.output / 'metrics.jsonl').open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps(metrics) + '\n')
             print(json.dumps(metrics), flush=True)
+        # Only normal completion: never serialize a partially updated iteration
+        # after Ctrl+C during self-play or an optimizer step.
+        if iteration != last_saved_iteration:
+            elapsed = previous_elapsed + time.perf_counter() - started
+            save_checkpoint(latest, model, optimizer, replay, rng, config, iteration, elapsed)
     except KeyboardInterrupt:
-        print('\nInterrupted. Incomplete work is discarded when resuming.', flush=True)
+        print(f'\nInterrupted. Resume from saved iteration {last_saved_iteration}; '
+              'unsaved work is discarded.', flush=True)
     finally:
         if pool is not None:
             pool.close()
