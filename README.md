@@ -1,5 +1,8 @@
 # Go RL Baseline
 
+Para recuperar el entrenamiento 9×9 saturado y preparar la RTX 3070,
+ver [RECUPERACION.md](RECUPERACION.md).
+
 ## Entrenamiento inicial: Atari Go 5×5
 
 Se agregó una implementación pequeña estilo AlphaZero basada en PyTorch:
@@ -62,8 +65,9 @@ incluyendo el tamaño medio y máximo de los lotes de inferencia.
 
 Se puede reanudar con `--resume .../latest.pt --device cuda --workers 18`.
 Los parámetros de ejecución se eligen en cada invocación; los del experimento
-(incluidas partidas por iteración) se recuperan del checkpoint. Un checkpoint
-antiguo con 8 partidas utilizará como máximo 8 workers. `--workers 1` conserva
+se recuperan del checkpoint salvo los que se indiquen explícitamente en el comando.
+Por ejemplo, `--games-per-iteration 80` sí reemplaza el valor guardado.
+No se puede cambiar tamaño ni arquitectura al reanudar. `--workers 1` conserva
 el camino secuencial. Las semillas se asignan por partida y los resultados se
 almacenan en orden estable, aunque cambios de dispositivo o agrupación pueden
 producir diferencias numéricas. Ctrl+C cierra los workers y conserva el último
@@ -76,7 +80,7 @@ negras en B3 y C2, blancas en C3 y B2; negras al turno. Son piedras de
 preparación, no jugadas, y no cuentan como capturas. Para comenzar vacío usar
 `--initial-position empty`. La elección queda guardada en la configuración.
 Al reanudar un checkpoint anterior a esta opción, se conserva el inicio vacío;
-para entrenar con la nueva posición, iniciar una carpeta nueva sin `--resume`.
+para cambiarlo indicar explícitamente `--initial-position central` o `mixed`.
 Go estándar continúa comenzando vacío.
 
 `play.py` y `watch_atari.py` usan la posición central por defecto incluso al
@@ -155,7 +159,8 @@ cada intervalo de evaluación. Solo `latest.pt` permite reanudar entrenamiento.
 ```
 
 Al reanudar se recupera la configuración del checkpoint; `--iterations` es el
-total acumulado, y `--hours` se aplica a esa invocación. Se puede cambiar el
+total acumulado; `--additional-iterations N` permite pedir N iteraciones más
+sin calcular ese total. No se combinan ambas opciones. `--hours` se aplica a esa invocación. Se puede cambiar el
 dispositivo. `config.json` registra parámetros y `metrics.jsonl` los resultados
 por iteración. Un fallo entre guardar y escribir métricas puede dejar la última
 fila ausente; el checkpoint determina la iteración real al reanudar.

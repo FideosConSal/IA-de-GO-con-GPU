@@ -432,6 +432,28 @@ class GoEnv:
             moves.append(self.pass_move)
         return moves
 
+    def atari_liberties(self, player: int) -> set[int]:
+        """Return the last liberties of this player's groups in atari."""
+        seen = set()
+        liberties = set()
+        for row, col in np.argwhere(self.board == player):
+            point = (int(row), int(col))
+            if point in seen:
+                continue
+            group, free = self._group_and_liberties(self.board, *point)
+            seen.update(group)
+            if len(free) == 1:
+                r, c = next(iter(free))
+                liberties.add(r * self.size + c)
+        return liberties
+
+    def immediate_capture_moves(self) -> list[int]:
+        """Legal moves that capture now, including ko/suicide validation."""
+        if self.done:
+            return []
+        return [move for move in sorted(self.atari_liberties(self.opponent(self.current_player)))
+                if self.is_legal(move)]
+
     def action_mask(self, dtype: np.dtype | type = np.bool_) -> np.ndarray:
         """Crea una máscara de acciones legales con longitud ``action_size``."""
         mask = np.zeros(self.action_size, dtype=dtype)

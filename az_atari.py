@@ -43,9 +43,10 @@ class PolicyValueNet(nn.Module):
                                    nn.Linear(channels, channels), nn.ReLU(),
                                    nn.Linear(channels, 1), nn.Tanh())
 
-    def forward(self, x):
+    def forward(self, x, raw_value=False):
         x = self.body(x)
-        return self.policy(x).flatten(1), self.value(x).squeeze(1)
+        value = self.value[:-1](x).squeeze(1)
+        return self.policy(x).flatten(1), value if raw_value else value.tanh()
 
 
 @dataclass
@@ -75,15 +76,34 @@ def expand(node, env, model, device, evaluator=None):
     return float(value)
 
 
-def search(env, model, device, rng, simulations=32, noise=False, c_puct=1.5, evaluator=None):
+def search(env, model, device, rng, simulations=32, noise=False, c_puct=1.5, evaluator=None, tactical=True):
     if env.game_mode != 'atari' or env.done:
         raise ValueError('Search requires a nonterminal Atari Go position.')
     if simulations < 1:
         raise ValueError('simulations must be positive')
+    safe = None
+    if tactical:
+        wins = env.immediate_capture_moves()
+        if wins:
+            policy = np.zeros(env.size ** 2, dtype=np.float32)
+            policy[wins] = 1 / len(wins)
+            return policy
+        if env.atari_liberties(env.current_player):
+            safe = []
+            for move in env.legal_moves():
+                child = env.copy()
+                child.play_move(move)
+                if child.done or not child.immediate_capture_moves():
+                    safe.append(move)
     if model is not None:
         model.eval()
     root = Node()
     expand(root, env, model, device, evaluator)
+    if safe:
+        root.children = {move: child for move, child in root.children.items() if move in safe}
+        total = sum(child.prior for child in root.children.values())
+        for child in root.children.values():
+            child.prior = child.prior / total if total else 1 / len(root.children)
     if noise:
         samples = rng.dirichlet(np.full(len(root.children), 0.3))
         for child, sample in zip(root.children.values(), samples):
@@ -111,13 +131,14 @@ def search(env, model, device, rng, simulations=32, noise=False, c_puct=1.5, eva
 
 
 def self_play(model, device, rng, size=5, simulations=32, initial_position='central', evaluator=None):
-    env = GoEnv(size=size, game_mode='atari', initial_position=initial_position)
+    from recovery import starting_position
+    env = starting_position(size, initial_position, rng)
     trajectory = []
     while not env.done:
         policy = search(env, model, device, rng, simulations, noise=True, evaluator=evaluator)
         trajectory.append((encode(env), policy, env.current_player))
         # Explore early, choose the most visited move later (random tie breaks).
-        if env.move_number < 10:
+        if len(trajectory) <= 10:
             move = int(rng.choice(len(policy), p=policy.astype(float) / policy.sum(dtype=float)))
         else:
             move = int(rng.choice(np.flatnonzero(policy == policy.max())))
@@ -132,27 +153,41 @@ def augment(state, policy, rng):
     policy = np.rot90(policy.reshape(size, size), turns)
     if rng.random() < 0.5:
         state, policy = state[..., ::-1], policy[:, ::-1]
+    # Atari Go has no komi: exchanging absolute colors preserves relative
+    # boards, legal moves and outcomes. Remove the color shortcut in training.
+    state = state.copy()
+    if rng.random() < 0.5:
+        state[5] = 1 - state[5]
     return state.copy(), policy.flatten().copy()
 
 
 def train_steps(model, optimizer, replay, rng, device, steps, batch_size):
     model.train()
-    totals = np.zeros(2)
+    totals = np.zeros(4)
     for _ in range(steps):
         batch = [replay[int(i)] for i in rng.integers(len(replay), size=batch_size)]
         augmented = [augment(x, p, rng) for x, p, _ in batch]
         states = torch.from_numpy(np.stack([a[0] for a in augmented])).to(device)
         policies = torch.from_numpy(np.stack([a[1] for a in augmented])).to(device)
         outcomes = torch.tensor([b[2] for b in batch], dtype=torch.float32, device=device)
-        logits, values = model(states)
+        logits, raw_values = model(states, raw_value=True)
+        values = raw_values.tanh()
         policy_loss = -(policies * logits.log_softmax(dim=1)).sum(dim=1).mean()
-        value_loss = nn.functional.mse_loss(values, outcomes)
+        # tanh(v) == 2*sigmoid(2*v)-1. Compute BCE on logits so wrong,
+        # saturated predictions still get a gradient; smoothing limits confidence.
+        value_loss = nn.functional.binary_cross_entropy_with_logits(
+            2 * raw_values, (outcomes * 0.98 + 1) / 2)
+        if not torch.isfinite(policy_loss + value_loss):
+            raise FloatingPointError('Non-finite training loss; last completed checkpoint remains available')
         optimizer.zero_grad(set_to_none=True)
         (policy_loss + value_loss).backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
         optimizer.step()
-        totals += [policy_loss.item(), value_loss.item()]
-    return dict(zip(('policy_loss', 'value_loss'), (totals / steps).tolist()))
+        totals += [policy_loss.item(), value_loss.item(),
+                   nn.functional.mse_loss(values, outcomes).item(),
+                   (values.abs() >= 0.999).float().mean().item()]
+    return dict(zip(('policy_loss', 'value_loss', 'value_mse', 'value_saturation'),
+                    (totals / steps).tolist()))
 
 
 def evaluate(model, device, size, simulations, games, seed, initial_position='central'):
@@ -160,7 +195,8 @@ def evaluate(model, device, size, simulations, games, seed, initial_position='ce
     rng = np.random.default_rng(seed)
     wins = 0
     for game in range(games):
-        env = GoEnv(size=size, game_mode='atari', initial_position=initial_position)
+        from recovery import starting_position
+        env = starting_position(size, initial_position, np.random.default_rng(seed + game // 2))
         color = 1 + game % 2
         while not env.done:
             if env.current_player == color:

@@ -39,7 +39,7 @@ class TrainingTests(unittest.TestCase):
     def test_search_finds_capture_and_masks_illegal(self):
         env = GoEnv(3, 'atari')
         env.load_position(np.array([[0, 1, 0], [1, 2, 1], [0, 0, 0]]), current_player=1)
-        policy = search(env, self.model, 'cpu', self.rng, 80)
+        policy = search(env, self.model, 'cpu', self.rng, 80, tactical=False)
         self.assertEqual(int(policy.argmax()), 7)
         self.assertAlmostEqual(float(policy.sum()), 1.0, places=6)
         self.assertTrue(np.all(policy[~env.action_mask()] == 0))

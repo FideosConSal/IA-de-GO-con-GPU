@@ -14,11 +14,12 @@ class ParallelTests(unittest.TestCase):
         try:
             for round_number in range(2):
                 seed = 45 + round_number
+                setup = 'central' if round_number == 0 else 'mixed'
                 games, metrics = pool.generate(model, 'cpu', np.random.default_rng(seed),
-                                               3, 5, 3, 'central')
+                                               3, 5, 3, setup)
                 seeds = np.random.default_rng(seed).integers(0, 2**63 - 1, size=3)
                 for actual, game_seed in zip(games, seeds):
-                    expected = self_play(model, 'cpu', np.random.default_rng(game_seed), 5, 3, 'central')
+                    expected = self_play(model, 'cpu', np.random.default_rng(game_seed), 5, 3, setup)
                     self.assertEqual(len(actual), len(expected))
                     for (x, p, z), (ex, ep, ez) in zip(actual, expected):
                         np.testing.assert_array_equal(x, ex)

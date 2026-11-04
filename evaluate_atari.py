@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from az_atari import PolicyValueNet, search
 from go_env import GoEnv
+from recovery import starting_position, tactical_metrics
 
 
 def load_model(path, device):
@@ -24,13 +25,19 @@ def main():
     parser.add_argument('--simulations', type=int, default=32)
     parser.add_argument('--seed', type=int, default=12345)
     parser.add_argument('--device', choices=['cpu', 'cuda'], default='cpu')
-    parser.add_argument('--initial-position', choices=['central', 'empty'],
+    parser.add_argument('--tactics-only', action='store_true', help='Report fixed capture/defense checks and color bias')
+    parser.add_argument('--initial-position', choices=['central', 'empty', 'mixed'],
                         help='Default: checkpoint setup (empty for legacy checkpoints)')
     args = parser.parse_args()
     if args.games < 2 or args.games % 2 or args.simulations < 1:
         parser.error('Use a positive even number of games and positive simulations')
     torch.set_num_threads(2)
     model, config = load_model(args.checkpoint, args.device)
+    if args.tactics_only:
+        if config['size'] < 5:
+            parser.error('Tactical checks require size >= 5')
+        print(json.dumps(tactical_metrics(model, args.device, config['size'], args.simulations)))
+        return
     initial_position = args.initial_position or config.get('initial_position', 'empty')
     print(f'Initial position: {initial_position}')
     opponent = None
@@ -44,7 +51,9 @@ def main():
     wins = [0, 0]
     for game in range(args.games):
         color = 1 + game % 2
-        env = GoEnv(config['size'], 'atari', initial_position=initial_position)
+        # Each pair uses the same starting board, with model colors reversed.
+        env = starting_position(config['size'], initial_position,
+                                np.random.default_rng(args.seed + game // 2))
         while not env.done:
             actor = model if env.current_player == color else opponent
             if actor is None:

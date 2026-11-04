@@ -5,11 +5,13 @@ import json
 from pathlib import Path
 import time
 import math
+import sys
 
 import numpy as np
 import torch
 
 from az_atari import PolicyValueNet, self_play, train_steps, evaluate
+from recovery import reset_value, tactical_metrics
 
 
 def save_checkpoint(path, model, optimizer, replay, rng, config, iteration, elapsed):
@@ -26,14 +28,17 @@ def save_checkpoint(path, model, optimizer, replay, rng, config, iteration, elap
 
 
 def parser():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument('--output', type=Path, default=Path('runs/atari5'))
     p.add_argument('--resume', type=Path, help='Resume into the checkpoint directory')
+    p.add_argument('--reset-value', action='store_true', help='Reset value head and its optimizer state; requires a new output')
+    p.add_argument('--clear-replay', action='store_true', help='Discard old replay on resume; requires a new output')
     p.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     p.add_argument('--iterations', type=int, default=100, help='Total, including resumed iterations')
+    p.add_argument('--additional-iterations', type=int, help='Run this many iterations after the loaded checkpoint')
     p.add_argument('--hours', type=float, default=0, help='Soft time budget per invocation; 0 disables')
     p.add_argument('--size', type=int, default=5)
-    p.add_argument('--initial-position', choices=['central', 'empty'], default='central')
+    p.add_argument('--initial-position', choices=['central', 'empty', 'mixed'], default='central')
     p.add_argument('--channels', type=int, default=64)
     p.add_argument('--blocks', type=int, default=4)
     p.add_argument('--simulations', type=int, default=32)
@@ -57,6 +62,7 @@ def parser():
 def main():
     p = parser()
     args = p.parse_args()
+    explicit = {arg.split('=')[0] for arg in sys.argv[1:] if arg.startswith('--')}
     if args.checkpoint_every < 1:
         p.error('--checkpoint-every must be positive')
     if args.workers < 1 or args.inference_batch_size < 1 or not math.isfinite(args.batch_wait_ms) or args.batch_wait_ms < 0:
@@ -70,18 +76,34 @@ def main():
         if checkpoint['version'] != 1:
             p.error('Unsupported checkpoint version')
         for key in config_keys:
-            setattr(args, key, checkpoint['config'].get(key, 'empty') if key == 'initial_position'
-                    else checkpoint['config'][key])
-        args.output = args.resume.parent
+            saved = checkpoint['config'].get(key, 'empty') if key == 'initial_position' else checkpoint['config'][key]
+            if '--' + key.replace('_', '-') in explicit:
+                if key in ('size', 'channels', 'blocks') and getattr(args, key) != saved:
+                    p.error(f'Cannot change {key} on resume')
+            else:
+                setattr(args, key, saved)
+        if '--output' not in explicit:
+            args.output = args.resume.parent
+    fork = bool(args.resume and args.output.resolve() != args.resume.parent.resolve())
+    if (args.reset_value or args.clear_replay) and not (checkpoint and fork):
+        p.error('--reset-value/--clear-replay require --resume and a different --output')
+    if (not checkpoint or fork) and args.output.exists() and any(args.output.iterdir()):
+        p.error('New output directory must be empty')
+    if args.additional_iterations is not None:
+        if args.additional_iterations < 1 or '--iterations' in explicit:
+            p.error('Use positive --additional-iterations without --iterations')
+        args.iterations = (checkpoint['iteration'] if checkpoint else 0) + args.additional_iterations
     for key in config_keys:
-        if key not in ('seed', 'initial_position') and getattr(args, key) <= 0:
+        if key not in ('seed', 'initial_position') and (not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0):
             p.error(f'{key} must be positive')
-    if not 2 <= args.size <= 19 or args.threads < 1 or args.iterations < 1 or args.hours < 0:
+    if not 2 <= args.size <= 19 or args.threads < 1 or args.iterations < 1 or not math.isfinite(args.hours) or args.hours < 0:
         p.error('Invalid size, threads, iterations or hours')
     if args.eval_games % 2:
         p.error('--eval-games must be even for balanced colors')
     if args.initial_position == 'central' and args.size < 3:
         p.error('Central setup requires size >= 3')
+    if args.initial_position == 'mixed' and args.size < 5:
+        p.error('Mixed setup requires size >= 5')
     if args.device == 'cuda' and not torch.cuda.is_available():
         p.error('CUDA unavailable. Install a CUDA PyTorch build or use --device cpu.')
     device = torch.device(('cuda' if torch.cuda.is_available() else 'cpu')
@@ -94,23 +116,34 @@ def main():
     replay = deque(maxlen=args.buffer_size)
     iteration, previous_elapsed = 0, 0.0
     config = {key: getattr(args, key) for key in config_keys}
+    config['value_objective'] = 'bce_logits_smoothing_0.02'
     if checkpoint:
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        replay.extend((x.numpy(), policy.numpy(), z) for x, policy, z in checkpoint['replay'])
-        rng.bit_generator.state = checkpoint['rng']
-        torch.set_rng_state(checkpoint['torch_rng'])
-        if device.type == 'cuda' and checkpoint['cuda_rng']:
-            torch.cuda.set_rng_state_all(checkpoint['cuda_rng'])
+        for group in optimizer.param_groups:
+            group['lr'] = args.learning_rate
+        if not args.clear_replay:
+            replay.extend((x.numpy(), policy.numpy(), z) for x, policy, z in checkpoint['replay'])
+        if '--seed' not in explicit:
+            rng.bit_generator.state = checkpoint['rng']
+            torch.set_rng_state(checkpoint['torch_rng'])
+            if device.type == 'cuda' and checkpoint['cuda_rng']:
+                torch.cuda.set_rng_state_all(checkpoint['cuda_rng'])
         iteration, previous_elapsed = checkpoint['iteration'], checkpoint['elapsed']
+        if args.reset_value:
+            reset_value(model, optimizer)
     elif args.output.exists() and any(args.output.iterdir()):
         p.error('Output directory is not empty. Use --resume or a new --output.')
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'config.json').write_text(json.dumps(config, indent=2), encoding='utf-8')
     started = time.perf_counter()
     latest = args.output / 'latest.pt'
-    if not checkpoint:
-        save_checkpoint(latest, model, optimizer, replay, rng, config, 0, 0.0)
+    if not checkpoint or fork:
+        save_checkpoint(latest, model, optimizer, replay, rng, config, iteration, previous_elapsed)
+    if fork:
+        (args.output / 'recovery.json').write_text(json.dumps(dict(
+            source=str(args.resume.resolve()), iteration=iteration,
+            reset_value=args.reset_value, clear_replay=args.clear_replay), indent=2), encoding='utf-8')
     print(f'Device: {device}; Atari Go {args.size}x{args.size}; starting iteration {iteration}', flush=True)
     print(f'Initial position: {args.initial_position}', flush=True)
     runtime = dict(workers=args.workers, threads=args.threads,
@@ -136,6 +169,8 @@ def main():
                 break
             round_start = time.perf_counter()
             positions = 0
+            white_wins = 0
+            lengths = []
             inference_metrics = {}
             if pool is None:
                 games = (self_play(model, device, rng, args.size, args.simulations, args.initial_position)
@@ -146,6 +181,11 @@ def main():
             for game, samples in enumerate(games):
                 replay.extend(samples)
                 positions += len(samples)
+                lengths.append(len(samples))
+                first_state, _, outcome = samples[0]
+                first_player = 1 if first_state[5, 0, 0] else 2
+                winner = first_player if outcome > 0 else 3 - first_player
+                white_wins += winner == 2
                 print(f'Iteration {iteration + 1}: game {game + 1}/{args.games_per_iteration}, '
                       f'{len(samples)} moves', flush=True)
             play_seconds = time.perf_counter() - round_start
@@ -157,8 +197,13 @@ def main():
             if iteration % args.eval_every == 0:
                 metrics['random_win_rate'] = evaluate(model, device, args.size,
                     args.simulations, args.eval_games, args.seed + 100000, args.initial_position)
+                metrics.update(tactical_metrics(model, device, args.size, args.simulations))
+            if metrics.get('value_saturation', 0) > 0.9:
+                print('WARNING: more than 90% of sampled values are saturated; inspect tactical metrics.', flush=True)
             elapsed = previous_elapsed + time.perf_counter() - started
             metrics.update(iteration=iteration, positions=positions, replay_size=len(replay),
+                           mean_game_moves=float(np.mean(lengths)),
+                           selfplay_white_win_rate=white_wins / len(lengths),
                            self_play_seconds=play_seconds,
                            games_per_hour=args.games_per_iteration * 3600 / play_seconds,
                            iteration_seconds=time.perf_counter() - round_start,
