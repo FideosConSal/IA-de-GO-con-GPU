@@ -61,7 +61,9 @@ def _announce_result(env: GoEnv, result) -> None:
         print("Motivo: primera captura en Atari Go.")
     elif result.reason == "no_legal_moves":
         print("Motivo: el siguiente jugador no tiene movimientos legales.")
-    elif result.reason == "double_pass" and result.score is not None:
+    elif result.reason in ("double_pass", "move_limit") and result.score is not None:
+        if result.reason == 'move_limit':
+            print('Motivo: límite de jugadas; adjudicación por área del tablero actual.')
         score = result.score
         print(
             "Conteo de área: "
@@ -73,10 +75,10 @@ def _announce_result(env: GoEnv, result) -> None:
 
 def main(argv: Optional[list[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Juega contra el agente aleatorio o un modelo de Atari Go."
+        description="Juega Go estándar o Atari Go contra un agente aleatorio o entrenado."
     )
     parser.add_argument("--size", type=int, help="Tamaño; con modelo se obtiene del checkpoint.")
-    parser.add_argument("--checkpoint", help="Ruta a latest.pt o model_XXXXX.pt de Atari Go.")
+    parser.add_argument("--checkpoint", help="Ruta a latest.pt o model_XXXXX.pt; la variante se obtiene del modelo.")
     parser.add_argument("--initial-position", choices=("central", "empty"),
                         help="Atari Go usa central por defecto; Go estándar usa empty.")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
@@ -91,7 +93,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         choices=("black", "white"),
         help="Color humano. Si se omite, se pregunta al comenzar.",
     )
-    parser.add_argument("--komi", type=float, default=7.5)
+    parser.add_argument("--komi", type=float)
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args(argv)
 
@@ -99,8 +101,6 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.simulations < 1:
         parser.error("--simulations debe ser positivo.")
     if args.checkpoint:
-        if args.mode not in (None, "atari"):
-            parser.error("Los modelos actuales solo admiten --mode atari.")
         try:
             import numpy as np
             import torch
@@ -118,7 +118,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         if args.size is not None and args.size != config['size']:
             parser.error("--size debe coincidir con el tamaño del checkpoint.")
         args.size = config['size']
-        args.mode = "atari"
+        checkpoint_mode = config.get('game_mode', 'atari')
+        if args.mode is not None and args.mode != checkpoint_mode:
+            parser.error('--mode debe coincidir con el checkpoint.')
+        args.mode = checkpoint_mode
+        if checkpoint_mode == 'standard':
+            if args.komi is not None and args.komi != config['komi']:
+                parser.error('--komi debe coincidir con el checkpoint.')
+            args.komi = config['komi']
         rng = np.random.default_rng(args.seed)
 
     mode = args.mode or _ask_choice(
@@ -135,7 +142,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     try:
         env = GoEnv(size=args.size if args.size is not None else 9, game_mode=mode,
-                    komi=args.komi, initial_position=args.initial_position)
+                    komi=args.komi if args.komi is not None else 7.5, initial_position=args.initial_position,
+                    max_moves=config.get('max_moves') if model is not None and mode == 'standard' else None)
     except ValueError as exc:
         parser.error(str(exc))
     machine = RandomAgent(seed=args.seed)
@@ -149,6 +157,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     print("(fila desde arriba, columna desde la izquierda; ambas 1-based).")
     if mode == "standard":
         print("Escriba 'pass' para pasar.")
+        if env.max_moves:
+            print(f'Límite del modelo: {env.max_moves} jugadas; al alcanzarlo se cuenta el área.')
     print("Escriba 'quit' para abandonar la interfaz.")
     print()
     print(env.render())

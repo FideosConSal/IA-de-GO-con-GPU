@@ -1,4 +1,4 @@
-"""Ver partidas de Atari Go entre modelos o contra un bot aleatorio."""
+"""Ver partidas de Go estándar o Atari entre modelos o contra un bot aleatorio."""
 import argparse
 import math
 import pickle
@@ -24,7 +24,7 @@ def main(argv=None):
     parser.add_argument('--step', action='store_true', help='Avanzar con Enter en vez de esperar.')
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     parser.add_argument('--seed', type=int, default=7)
-    parser.add_argument('--initial-position', choices=('central', 'empty'), default='central')
+    parser.add_argument('--initial-position', choices=('central', 'empty'))
     args = parser.parse_args(argv)
     if args.games < 1 or args.simulations < 1:
         parser.error('--games y --simulations deben ser positivos.')
@@ -42,20 +42,30 @@ def main(argv=None):
             opponent, other_config = load_model(args.opponent, args.device)
             if config['size'] != other_config['size']:
                 parser.error('Los modelos deben tener el mismo tamaño de tablero.')
+            if config.get('game_mode', 'atari') != other_config.get('game_mode', 'atari'):
+                parser.error('Los modelos deben ser de la misma variante.')
+            if config.get('game_mode') == 'standard' and any(config[k] != other_config[k] for k in ('komi','max_moves')):
+                parser.error('Komi y límite de jugadas deben coincidir.')
     except (OSError, RuntimeError, KeyError, ValueError, pickle.UnpicklingError) as exc:
         parser.error(f'No se pudo cargar el modelo: {exc}')
     rng = np.random.default_rng(args.seed)
+    mode = config.get('game_mode', 'atari')
+    args.initial_position = args.initial_position or ('empty' if mode == 'standard' else 'central')
+    if mode == 'standard' and args.initial_position != 'empty':
+        parser.error('Go estándar comienza vacío.')
     if args.initial_position == 'central' and config['size'] < 3:
         parser.error('La posición central requiere tamaño >= 3.')
     names = [args.checkpoint, 'aleatorio' if args.random else (args.opponent or args.checkpoint)]
     wins = [0, 0]
     completed = 0
     print(f'A: {names[0]}\nB: {names[1]}')
-    print('Atari Go: gana la primera captura. Ctrl+C para salir.', flush=True)
+    print('Go estándar: conteo de área y dos pases. Ctrl+C para salir.' if mode == 'standard'
+          else 'Atari Go: gana la primera captura. Ctrl+C para salir.', flush=True)
     print(f'Posición inicial: {args.initial_position}.', flush=True)
     try:
         for game in range(args.games):
-            env = GoEnv(config['size'], 'atari', initial_position=args.initial_position)
+            env = GoEnv(config['size'], mode, config.get('komi', 7.5), args.initial_position,
+                        config.get('max_moves') if mode == 'standard' else None)
             a_color = 1 + game % 2
             print(f'\nPartida {game + 1}/{args.games}: A={PLAYER_NAMES[a_color]}, '
                   f'B={PLAYER_NAMES[env.opponent(a_color)]}', flush=True)
@@ -76,9 +86,12 @@ def main(argv=None):
                     policy = search(env, actor, args.device, rng, args.simulations, noise=False)
                     move = int(rng.choice(np.flatnonzero(policy == policy.max())))
                 _announce_result(env, env.play_move(move))
+            completed += 1
+            if env.winner is None:
+                print('Empate.', flush=True)
+                continue
             winner = 0 if env.winner == a_color else 1
             wins[winner] += 1
-            completed += 1
             print(f'Ganó el bot {"A" if winner == 0 else "B"}. '
                   f'Marcador: A {wins[0]} - B {wins[1]}', flush=True)
     except (KeyboardInterrupt, EOFError):

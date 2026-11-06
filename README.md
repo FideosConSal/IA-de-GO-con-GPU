@@ -1,5 +1,8 @@
 # Go RL Baseline
 
+Para entrenar **Go estándar** (pases, conteo de área y komi), ver
+[GO_ESTANDAR.md](GO_ESTANDAR.md). Se inicia con `python train_go.py`.
+
 Para recuperar el entrenamiento 9×9 saturado y preparar la RTX 3070,
 ver [RECUPERACION.md](RECUPERACION.md).
 
@@ -76,7 +79,9 @@ checkpoint completo.
 ### Prueba funcional corta
 
 Los entrenamientos nuevos de Atari Go usan cuatro piedras centrales. En 5×5:
-negras en B3 y C2, blancas en C3 y B2; negras al turno. Son piedras de
+negras en D4 y C3, blancas en C4 y D3; negras al turno. En 9×9 son
+negras en F6 y E5, blancas en E6 y F5 (blancas en la diagonal superior
+izquierda/inferior derecha). Son piedras de
 preparación, no jugadas, y no cuentan como capturas. Para comenzar vacío usar
 `--initial-position empty`. La elección queda guardada en la configuración.
 Al reanudar un checkpoint anterior a esta opción, se conserva el inicio vacío;

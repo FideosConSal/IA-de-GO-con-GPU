@@ -76,6 +76,8 @@ def main():
         parser.error('Count and simulations must be positive')
     torch.set_num_threads(2)
     model, config = load_model(args.checkpoint, args.device)
+    if config.get('game_mode', 'atari') != 'atari':
+        parser.error('This capture diagnostic is for Atari Go, not standard Go')
     results = diagnose(model, args.device, config['size'], args.seed, args.count, args.simulations)
     results['checkpoint'] = str(args.checkpoint)
     text = json.dumps(results, indent=2)

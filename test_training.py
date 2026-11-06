@@ -15,8 +15,8 @@ class TrainingTests(unittest.TestCase):
     def test_central_setup_reset_copy_and_empty_option(self):
         env = GoEnv(5, 'atari')
         expected = np.zeros((5, 5), dtype=np.int8)
-        expected[2, 1], expected[3, 2] = 1, 1
-        expected[2, 2], expected[3, 1] = 2, 2
+        expected[1, 3], expected[2, 2] = 1, 1
+        expected[1, 2], expected[2, 3] = 2, 2
         np.testing.assert_array_equal(env.board, expected)
         self.assertEqual(env.current_player, 1)
         self.assertEqual(env.move_number, 0)
@@ -29,6 +29,12 @@ class TrainingTests(unittest.TestCase):
         np.testing.assert_array_equal(clone.board, expected)
         self.assertFalse(GoEnv(5, 'atari', initial_position='empty').board.any())
         self.assertFalse(GoEnv(5, 'standard').board.any())
+        # The user's 9x9 reference: E6 white, F6 black, E5 black, F5 white.
+        reference = GoEnv(9, 'atari')
+        expected9 = np.zeros((9, 9), dtype=np.int8)
+        expected9[3, 4] = expected9[4, 5] = 2
+        expected9[3, 5] = expected9[4, 4] = 1
+        np.testing.assert_array_equal(reference.board, expected9)
 
     def setUp(self):
         torch.set_num_threads(1)

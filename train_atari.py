@@ -1,4 +1,4 @@
-"""Train a small policy/value network via MCTS self-play in Atari Go."""
+"""Train a policy/value network via MCTS self-play in Atari or standard Go."""
 import argparse
 from collections import deque
 import json
@@ -27,9 +27,12 @@ def save_checkpoint(path, model, optimizer, replay, rng, config, iteration, elap
     temporary.replace(path)
 
 
-def parser():
+def parser(default_mode='atari'):
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    p.add_argument('--output', type=Path, default=Path('runs/atari5'))
+    p.add_argument('--output', type=Path, default=Path('runs/go5' if default_mode == 'standard' else 'runs/atari5'))
+    p.set_defaults(game_mode=default_mode)
+    p.add_argument('--komi', type=float, default=7.5)
+    p.add_argument('--max-moves', type=int, default=0, help='Standard Go: area adjudication limit; 0 chooses 4*size*size')
     p.add_argument('--resume', type=Path, help='Resume into the checkpoint directory')
     p.add_argument('--reset-value', action='store_true', help='Reset value head and its optimizer state; requires a new output')
     p.add_argument('--clear-replay', action='store_true', help='Discard old replay on resume; requires a new output')
@@ -38,7 +41,8 @@ def parser():
     p.add_argument('--additional-iterations', type=int, help='Run this many iterations after the loaded checkpoint')
     p.add_argument('--hours', type=float, default=0, help='Soft time budget per invocation; 0 disables')
     p.add_argument('--size', type=int, default=5)
-    p.add_argument('--initial-position', choices=['central', 'empty', 'mixed'], default='central')
+    p.add_argument('--initial-position', choices=['central', 'empty', 'mixed'],
+                   default='empty' if default_mode == 'standard' else 'central')
     p.add_argument('--channels', type=int, default=64)
     p.add_argument('--blocks', type=int, default=4)
     p.add_argument('--simulations', type=int, default=32)
@@ -59,8 +63,8 @@ def parser():
     return p
 
 
-def main():
-    p = parser()
+def main(default_mode='atari'):
+    p = parser(default_mode)
     args = p.parse_args()
     explicit = {arg.split('=')[0] for arg in sys.argv[1:] if arg.startswith('--')}
     if args.checkpoint_every < 1:
@@ -69,16 +73,19 @@ def main():
         p.error('Invalid workers, inference batch size or wait')
     config_keys = ('size', 'channels', 'blocks', 'simulations', 'games_per_iteration',
                    'train_steps', 'batch_size', 'buffer_size', 'learning_rate', 'seed',
-                   'eval_every', 'eval_games', 'initial_position')
+                   'eval_every', 'eval_games', 'initial_position', 'game_mode', 'komi', 'max_moves')
     checkpoint = None
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
         if checkpoint['version'] != 1:
             p.error('Unsupported checkpoint version')
+        if checkpoint['config'].get('game_mode', 'atari') != default_mode:
+            p.error('Checkpoint belongs to a different game mode; Atari and standard Go cannot be resumed into each other')
         for key in config_keys:
-            saved = checkpoint['config'].get(key, 'empty') if key == 'initial_position' else checkpoint['config'][key]
+            legacy = {'initial_position': 'empty', 'game_mode': 'atari', 'komi': 7.5, 'max_moves': 0}
+            saved = checkpoint['config'].get(key, legacy.get(key))
             if '--' + key.replace('_', '-') in explicit:
-                if key in ('size', 'channels', 'blocks') and getattr(args, key) != saved:
+                if key in ('size', 'channels', 'blocks', 'komi', 'max_moves') and getattr(args, key) != saved:
                     p.error(f'Cannot change {key} on resume')
             else:
                 setattr(args, key, saved)
@@ -94,12 +101,18 @@ def main():
             p.error('Use positive --additional-iterations without --iterations')
         args.iterations = (checkpoint['iteration'] if checkpoint else 0) + args.additional_iterations
     for key in config_keys:
-        if key not in ('seed', 'initial_position') and (not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0):
+        if key not in ('seed', 'initial_position', 'game_mode', 'komi', 'max_moves') and (not math.isfinite(getattr(args, key)) or getattr(args, key) <= 0):
             p.error(f'{key} must be positive')
     if not 2 <= args.size <= 19 or args.threads < 1 or args.iterations < 1 or not math.isfinite(args.hours) or args.hours < 0:
         p.error('Invalid size, threads, iterations or hours')
     if args.eval_games % 2:
         p.error('--eval-games must be even for balanced colors')
+    if not math.isfinite(args.komi) or args.max_moves < 0 or args.max_moves == 1:
+        p.error('Komi must be finite; max-moves must be 0 or >= 2')
+    if args.game_mode == 'standard':
+        if args.initial_position != 'empty':
+            p.error('Standard Go training starts from an empty board')
+        args.max_moves = args.max_moves or 4 * args.size * args.size
     if args.initial_position == 'central' and args.size < 3:
         p.error('Central setup requires size >= 3')
     if args.initial_position == 'mixed' and args.size < 5:
@@ -111,7 +124,7 @@ def main():
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
-    model = PolicyValueNet(args.channels, args.blocks).to(device)
+    model = PolicyValueNet(args.channels, args.blocks, args.game_mode).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     replay = deque(maxlen=args.buffer_size)
     iteration, previous_elapsed = 0, 0.0
@@ -144,7 +157,9 @@ def main():
         (args.output / 'recovery.json').write_text(json.dumps(dict(
             source=str(args.resume.resolve()), iteration=iteration,
             reset_value=args.reset_value, clear_replay=args.clear_replay), indent=2), encoding='utf-8')
-    print(f'Device: {device}; Atari Go {args.size}x{args.size}; starting iteration {iteration}', flush=True)
+    print(f'Device: {device}; {args.game_mode} Go {args.size}x{args.size}; starting iteration {iteration}', flush=True)
+    game_options = (dict(game_mode='standard', komi=args.komi, max_moves=args.max_moves)
+                    if args.game_mode == 'standard' else {})
     print(f'Initial position: {args.initial_position}', flush=True)
     runtime = dict(workers=args.workers, threads=args.threads,
                    checkpoint_every=args.checkpoint_every,
@@ -171,20 +186,24 @@ def main():
             positions = 0
             white_wins = 0
             lengths = []
+            game_stats = []
+            draws = 0
             inference_metrics = {}
             if pool is None:
-                games = (self_play(model, device, rng, args.size, args.simulations, args.initial_position)
+                games = (self_play(model, device, rng, args.size, args.simulations, args.initial_position, **game_options)
                          for _ in range(args.games_per_iteration))
             else:
                 games, inference_metrics = pool.generate(model, device, rng, args.games_per_iteration,
-                                                        args.size, args.simulations, args.initial_position)
+                                                        args.size, args.simulations, args.initial_position, **game_options)
             for game, samples in enumerate(games):
                 replay.extend(samples)
                 positions += len(samples)
                 lengths.append(len(samples))
+                game_stats.append(getattr(samples, 'stats', {}))
                 first_state, _, outcome = samples[0]
                 first_player = 1 if first_state[5, 0, 0] else 2
-                winner = first_player if outcome > 0 else 3 - first_player
+                winner = (first_player if outcome > 0 else 3 - first_player) if outcome else None
+                draws += winner is None
                 white_wins += winner == 2
                 print(f'Iteration {iteration + 1}: game {game + 1}/{args.games_per_iteration}, '
                       f'{len(samples)} moves', flush=True)
@@ -196,8 +215,16 @@ def main():
             iteration += 1
             if iteration % args.eval_every == 0:
                 metrics['random_win_rate'] = evaluate(model, device, args.size,
-                    args.simulations, args.eval_games, args.seed + 100000, args.initial_position)
-                metrics.update(tactical_metrics(model, device, args.size, args.simulations))
+                    args.simulations, args.eval_games, args.seed + 100000, args.initial_position, **game_options)
+                if args.game_mode == 'atari':
+                    metrics.update(tactical_metrics(model, device, args.size, args.simulations))
+            if args.game_mode == 'standard':
+                metrics.update(
+                    move_limit_rate=sum(s.get('reason') == 'move_limit' for s in game_stats)/len(game_stats),
+                    double_pass_rate=sum(s.get('reason') == 'double_pass' for s in game_stats)/len(game_stats),
+                    mean_passes=float(np.mean([s['passes'] for s in game_stats])),
+                    mean_score_margin=float(np.mean([s['score_margin'] for s in game_stats])),
+                    draw_rate=draws/len(game_stats))
             if metrics.get('value_saturation', 0) > 0.9:
                 print('WARNING: more than 90% of sampled values are saturated; inspect tactical metrics.', flush=True)
             elapsed = previous_elapsed + time.perf_counter() - started

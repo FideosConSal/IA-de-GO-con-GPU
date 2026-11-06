@@ -25,14 +25,14 @@ def _worker(connection):
             job = connection.recv()
             if job is None:
                 return
-            game_id, seed, size, simulations, initial_position = job
+            game_id, seed, size, simulations, initial_position, game_options = job
 
             def infer(state):
                 connection.send(('infer', state))
                 return connection.recv()
 
             samples = self_play(None, 'cpu', np.random.default_rng(seed), size,
-                                simulations, initial_position, evaluator=infer)
+                                simulations, initial_position, evaluator=infer, **game_options)
             connection.send(('done', (game_id, samples)))
     except (EOFError, BrokenPipeError):
         pass
@@ -83,7 +83,7 @@ class ParallelSelfPlay:
             process.join(timeout=2)
 
     @torch.inference_mode()
-    def generate(self, model, device, rng, games, size, simulations, initial_position):
+    def generate(self, model, device, rng, games, size, simulations, initial_position, **game_options):
         if games < 1:
             raise ValueError('games must be positive')
         model.eval()
@@ -97,7 +97,7 @@ class ParallelSelfPlay:
 
         def dispatch(connection):
             nonlocal next_game
-            connection.send((next_game, seeds[next_game], size, simulations, initial_position))
+            connection.send((next_game, seeds[next_game], size, simulations, initial_position, game_options))
             next_game += 1
             active.add(connection)
 

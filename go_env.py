@@ -131,6 +131,7 @@ class GoEnv:
         game_mode: str = "standard",
         komi: float = 7.5,
         initial_position: Optional[str] = None,
+        max_moves: Optional[int] = None,
     ) -> None:
         if not isinstance(size, int) or isinstance(size, bool):
             raise TypeError("size debe ser un entero.")
@@ -144,6 +145,9 @@ class GoEnv:
         self.size = size
         self.game_mode = normalized_mode
         self.komi = float(komi)
+        if max_moves is not None and (not isinstance(max_moves, int) or max_moves < 2):
+            raise ValueError('max_moves debe ser >= 2 o None.')
+        self.max_moves = max_moves
         self.initial_position = initial_position or (
             "central" if normalized_mode == "atari" and size >= 3 else "empty"
         )
@@ -176,10 +180,11 @@ class GoEnv:
         """Reinicia la partida y devuelve la codificación básica del estado."""
         self.board = np.zeros((self.size, self.size), dtype=np.int8)
         if self.initial_position == "central":
-            # On 5x5: black B3/C2, white C3/B2; setup is not a played move.
-            row, col = (self.size - 1) // 2, (self.size - 2) // 2
-            self.board[row, col] = self.board[row + 1, col + 1] = BLACK
-            self.board[row, col + 1] = self.board[row + 1, col] = WHITE
+            # Reference orientation: white upper-left/lower-right, black
+            # upper-right/lower-left. On 9x9: white E6/F5, black F6/E5.
+            row, col = (self.size - 2) // 2, (self.size - 1) // 2
+            self.board[row, col] = self.board[row + 1, col + 1] = WHITE
+            self.board[row, col + 1] = self.board[row + 1, col] = BLACK
         self.previous_board: Optional[np.ndarray] = None
         self.current_player = BLACK
         self.consecutive_passes = 0
@@ -194,7 +199,7 @@ class GoEnv:
 
     def copy(self) -> "GoEnv":
         """Crea una copia profunda apropiada para búsqueda o MCTS."""
-        cloned = GoEnv(self.size, self.game_mode, self.komi, self.initial_position)
+        cloned = GoEnv(self.size, self.game_mode, self.komi, self.initial_position, self.max_moves)
         cloned.board = self.board.copy()
         cloned.previous_board = (
             None if self.previous_board is None else self.previous_board.copy()
@@ -492,9 +497,9 @@ class GoEnv:
             self.current_player = opponent
 
             score: Optional[AreaScore] = None
-            if self.consecutive_passes >= 2:
+            if self.consecutive_passes >= 2 or (self.max_moves is not None and self.move_number >= self.max_moves):
                 self.done = True
-                self.terminal_reason = "double_pass"
+                self.terminal_reason = "double_pass" if self.consecutive_passes >= 2 else "move_limit"
                 score = self.area_score()
                 self.final_score = score
                 self.winner = score.winner
@@ -535,6 +540,12 @@ class GoEnv:
                 self.winner = player
                 self.terminal_reason = "no_legal_moves"
 
+        if self.game_mode == 'standard' and self.max_moves is not None and self.move_number >= self.max_moves:
+            self.done = True
+            self.terminal_reason = 'move_limit'
+            self.final_score = self.area_score()
+            self.winner = self.final_score.winner
+
         result = MoveResult(
             move=normalized,
             player=player,
@@ -543,7 +554,7 @@ class GoEnv:
             done=self.done,
             winner=self.winner,
             reason=self.terminal_reason,
-            score=None,
+            score=self.final_score,
         )
         self.last_result = result
         return result

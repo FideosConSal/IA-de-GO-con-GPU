@@ -1,4 +1,4 @@
-"""Small AlphaZero-style components for Atari Go; values are player-relative."""
+"""Shared AlphaZero-style components for Go; values are player-relative."""
 from dataclasses import dataclass, field
 import math
 
@@ -16,9 +16,16 @@ def encode(env):
     previous = env.previous_board
     if previous is None:
         previous = np.zeros_like(env.board)
-    return np.stack([env.board == player, env.board == other,
+    planes = [env.board == player, env.board == other,
                      env.board == 0, previous == player, previous == other,
-                     np.full_like(env.board, player == 1)]).astype(np.float32)
+                     np.full_like(env.board, player == 1)]
+    if env.game_mode == 'standard':
+        planes.extend([
+            np.full(env.board.shape, env.consecutive_passes, dtype=np.float32),
+            np.full(env.board.shape, env.komi * (1 if player == 2 else -1) / env.size**2, dtype=np.float32),
+            np.full(env.board.shape, max(0, 1-env.move_number/env.max_moves) if env.max_moves else 1,
+                    dtype=np.float32)])
+    return np.stack(planes).astype(np.float32)
 
 
 class Residual(nn.Module):
@@ -34,11 +41,16 @@ class Residual(nn.Module):
 
 class PolicyValueNet(nn.Module):
     """No size-dependent weights: also accepts larger boards."""
-    def __init__(self, channels=64, blocks=4):
+    def __init__(self, channels=64, blocks=4, game_mode='atari'):
         super().__init__()
-        self.body = nn.Sequential(nn.Conv2d(6, channels, 3, padding=1),
+        if game_mode not in ('atari', 'standard'):
+            raise ValueError('Unknown game mode')
+        self.game_mode = game_mode
+        self.body = nn.Sequential(nn.Conv2d(9 if game_mode == 'standard' else 6, channels, 3, padding=1),
                                   nn.ReLU(), *[Residual(channels) for _ in range(blocks)])
         self.policy = nn.Conv2d(channels, 1, 1)
+        if game_mode == 'standard':
+            self.pass_policy = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(channels, 1))
         self.value = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(),
                                    nn.Linear(channels, channels), nn.ReLU(),
                                    nn.Linear(channels, 1), nn.Tanh())
@@ -46,7 +58,10 @@ class PolicyValueNet(nn.Module):
     def forward(self, x, raw_value=False):
         x = self.body(x)
         value = self.value[:-1](x).squeeze(1)
-        return self.policy(x).flatten(1), value if raw_value else value.tanh()
+        policy = self.policy(x).flatten(1)
+        if self.game_mode == 'standard':
+            policy = torch.cat((policy, self.pass_policy(x)), dim=1)
+        return policy, value if raw_value else value.tanh()
 
 
 @dataclass
@@ -77,12 +92,14 @@ def expand(node, env, model, device, evaluator=None):
 
 
 def search(env, model, device, rng, simulations=32, noise=False, c_puct=1.5, evaluator=None, tactical=True):
-    if env.game_mode != 'atari' or env.done:
-        raise ValueError('Search requires a nonterminal Atari Go position.')
+    if env.done:
+        raise ValueError('Search requires a nonterminal position.')
+    if model is not None and model.game_mode != env.game_mode:
+        raise ValueError('Model and environment modes must match')
     if simulations < 1:
         raise ValueError('simulations must be positive')
     safe = None
-    if tactical:
+    if tactical and env.game_mode == 'atari':
         wins = env.immediate_capture_moves()
         if wins:
             policy = np.zeros(env.size ** 2, dtype=np.float32)
@@ -124,16 +141,23 @@ def search(env, model, device, rng, simulations=32, noise=False, c_puct=1.5, eva
             visited.visits += 1
             visited.total += value
             value = -value
-    policy = np.zeros(env.size ** 2, dtype=np.float32)
+    policy = np.zeros(env.action_size, dtype=np.float32)
     for move, child in root.children.items():
         policy[move] = child.visits
     return policy / policy.sum()
 
 
-def self_play(model, device, rng, size=5, simulations=32, initial_position='central', evaluator=None):
+class GameSamples(list):
+    """Replay samples with per-game diagnostics, also picklable by workers."""
+
+
+def self_play(model, device, rng, size=5, simulations=32, initial_position='central', evaluator=None,
+              game_mode='atari', komi=7.5, max_moves=None):
     from recovery import starting_position
-    env = starting_position(size, initial_position, rng)
+    env = (GoEnv(size, 'standard', komi, initial_position, max_moves or 4*size*size)
+           if game_mode == 'standard' else starting_position(size, initial_position, rng))
     trajectory = []
+    passes = 0
     while not env.done:
         policy = search(env, model, device, rng, simulations, noise=True, evaluator=evaluator)
         trajectory.append((encode(env), policy, env.current_player))
@@ -143,22 +167,27 @@ def self_play(model, device, rng, size=5, simulations=32, initial_position='cent
         else:
             move = int(rng.choice(np.flatnonzero(policy == policy.max())))
         env.play_move(move)
-    return [(x, p, env.terminal_value(player)) for x, p, player in trajectory]
+        passes += move == env.pass_move
+    samples = GameSamples((x, p, env.terminal_value(player)) for x, p, player in trajectory)
+    samples.stats = dict(reason=env.terminal_reason, passes=passes, winner=env.winner,
+                         score_margin=env.final_score.margin if env.final_score else None)
+    return samples
 
 
 def augment(state, policy, rng):
     size = state.shape[-1]
     turns = int(rng.integers(4))
     state = np.rot90(state, turns, axes=(-2, -1))
-    policy = np.rot90(policy.reshape(size, size), turns)
+    pass_probability = policy[size*size:].copy()
+    policy = np.rot90(policy[:size*size].reshape(size, size), turns)
     if rng.random() < 0.5:
         state, policy = state[..., ::-1], policy[:, ::-1]
     # Atari Go has no komi: exchanging absolute colors preserves relative
     # boards, legal moves and outcomes. Remove the color shortcut in training.
     state = state.copy()
-    if rng.random() < 0.5:
+    if len(state) == 6 and rng.random() < 0.5:
         state[5] = 1 - state[5]
-    return state.copy(), policy.flatten().copy()
+    return state.copy(), np.concatenate((policy.flatten(), pass_probability)).copy()
 
 
 def train_steps(model, optimizer, replay, rng, device, steps, batch_size):
@@ -190,13 +219,16 @@ def train_steps(model, optimizer, replay, rng, device, steps, batch_size):
                     (totals / steps).tolist()))
 
 
-def evaluate(model, device, size, simulations, games, seed, initial_position='central'):
+def evaluate(model, device, size, simulations, games, seed, initial_position='central',
+             game_mode='atari', komi=7.5, max_moves=None):
     """Balanced colors, fixed random opponent; a smoke metric, not playing strength."""
     rng = np.random.default_rng(seed)
     wins = 0
     for game in range(games):
         from recovery import starting_position
-        env = starting_position(size, initial_position, np.random.default_rng(seed + game // 2))
+        env = (GoEnv(size, 'standard', komi, initial_position, max_moves or 4*size*size)
+               if game_mode == 'standard' else
+               starting_position(size, initial_position, np.random.default_rng(seed + game // 2)))
         color = 1 + game % 2
         while not env.done:
             if env.current_player == color:
