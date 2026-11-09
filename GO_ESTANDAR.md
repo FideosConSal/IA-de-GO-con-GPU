@@ -22,7 +22,38 @@ El modelo de Go estándar se inicia desde cero. `--resume` no permite cargar
 modelos Atari: tienen otro espacio de acciones y otro significado del resultado.
 `train_atari.py` conserva su comportamiento y sus checkpoints son compatibles.
 
-## Reanudar
+## Medir el rendimiento
+
+Para medir el rendimiento de una copia del entrenamiento en la 3070, usa un
+destino nuevo y activa `--profile`. El comando hereda del checkpoint el tamaño
+de red, simulaciones, partidas por iteración y demás parámetros de aprendizaje.
+
+```text
+python train_go.py --resume runs/go9/latest.pt --output runs/go9_perfil --profile --device cuda --threads 20 --workers 40 --inference-batch-size 40 --batch-wait-ms 1 --additional-iterations 10 --checkpoint-every 5
+```
+
+Cada invocación imprime la ubicación de su carpeta `profile-*`. `train_atari.py`
+admite la misma opción. En `summary.json`, `phase_percent` distribuye el tiempo
+de pared entre autojuego, entrenamiento, evaluación y guardados. El resto incluye
+arranque y cierre de procesos y tareas auxiliares. La medición empieza después
+de cargar o crear el checkpoint inicial. `metrics.jsonl` conserva los tiempos
+por iteración para distinguir el arranque de los workers y las rondas con evaluación.
+
+En paralelo, `parent_wait_seconds` mide la espera en las conexiones del padre,
+`inference_wall_seconds` incluye preparación del lote, transferencias y red, y
+`cuda_forward_seconds` mide con eventos CUDA el intervalo del forward en la GPU.
+Estas cifras están incluidas en el autojuego y se solapan. La espera del padre
+puede incluir cálculo de los workers, arranque y el tiempo de agrupación de lotes.
+
+`parent_wall.txt` ordena funciones por tiempo propio y acumulado. Con varios
+workers, `worker_cpu.txt` hace lo mismo usando tiempo de CPU para la primera
+partida de un worker. Con un solo worker, MCTS se ejecuta en el proceso principal
+y aparece en `parent_wall.txt`. Los archivos `.prof` se pueden explorar con
+`python -m pstats <archivo.prof>`. Los tiempos acumulados de funciones anidadas
+se solapan. Para medir la ganancia de una optimización, compara también el
+rendimiento con profiling desactivado, desde el mismo checkpoint y configuración.
+
+## Continuar el entrenamiento
 
 ```text
 python train_go.py --resume runs/go9/latest.pt --device cuda --threads 20 --workers 40 --inference-batch-size 40 --batch-wait-ms 1 --additional-iterations 100000000 --hours 20 --checkpoint-every 5

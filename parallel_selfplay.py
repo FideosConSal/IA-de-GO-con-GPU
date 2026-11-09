@@ -25,14 +25,24 @@ def _worker(connection):
             job = connection.recv()
             if job is None:
                 return
-            game_id, seed, size, simulations, initial_position, game_options = job
+            game_id, seed, size, simulations, initial_position, game_options, sample_folder = job
 
             def infer(state):
                 connection.send(('infer', state))
                 return connection.recv()
 
-            samples = self_play(None, 'cpu', np.random.default_rng(seed), size,
-                                simulations, initial_position, evaluator=infer, **game_options)
+            profiler = None
+            if sample_folder:
+                import cProfile
+                profiler = cProfile.Profile(timer=time.process_time)
+                profiler.enable()
+            try:
+                samples = self_play(None, 'cpu', np.random.default_rng(seed), size,
+                                    simulations, initial_position, evaluator=infer, **game_options)
+            finally:
+                if profiler:
+                    from training_profile import save_profile
+                    save_profile(profiler, sample_folder, 'worker_cpu')
             connection.send(('done', (game_id, samples)))
     except (EOFError, BrokenPipeError):
         pass
@@ -43,11 +53,13 @@ def _worker(connection):
 
 
 class ParallelSelfPlay:
-    def __init__(self, workers, inference_batch_size=32, batch_wait_ms=2):
+    def __init__(self, workers, inference_batch_size=32, batch_wait_ms=2, profile_folder=None):
         if workers < 1 or inference_batch_size < 1 or batch_wait_ms < 0:
             raise ValueError('Invalid parallel self-play settings')
         self.batch_size = inference_batch_size
         self.wait_seconds = batch_wait_ms / 1000
+        self.profile_folder = profile_folder
+        self.sample_next_game = bool(profile_folder)
         self.connections, self.processes = [], []
         context = mp.get_context('spawn')
         # Limit native libraries in spawned interpreters, before their imports.
@@ -92,12 +104,19 @@ class ParallelSelfPlay:
         results, active, pending = {}, set(), []
         next_game = 0
         batches = requests = max_batch = 0
+        wait_seconds = inference_seconds = cuda_forward_ms = 0.0
+        cuda_timing = self.profile_folder and torch.device(device).type == 'cuda'
+        if cuda_timing:
+            forward_start = torch.cuda.Event(enable_timing=True)
+            forward_end = torch.cuda.Event(enable_timing=True)
         first_pending = None
         last_activity = time.monotonic()
 
         def dispatch(connection):
             nonlocal next_game
-            connection.send((next_game, seeds[next_game], size, simulations, initial_position, game_options))
+            sample_folder = self.profile_folder if self.sample_next_game else None
+            self.sample_next_game = False
+            connection.send((next_game, seeds[next_game], size, simulations, initial_position, game_options, sample_folder))
             next_game += 1
             active.add(connection)
 
@@ -108,7 +127,11 @@ class ParallelSelfPlay:
                 raise RuntimeError('Self-play worker exited unexpectedly')
             waiting = active.difference(connection for connection, _ in pending)
             timeout = 0.05 if not pending else max(0, self.wait_seconds - (time.monotonic() - first_pending))
+            if self.profile_folder:
+                wait_start = time.perf_counter()
             ready = wait(list(waiting), timeout=timeout) if waiting else []
+            if self.profile_folder:
+                wait_seconds += time.perf_counter() - wait_start
             for connection in ready:
                 kind, payload = connection.recv()
                 last_activity = time.monotonic()
@@ -129,9 +152,19 @@ class ParallelSelfPlay:
             if pending and (len(pending) >= self.batch_size or len(pending) == len(active)
                             or time.monotonic() - first_pending >= self.wait_seconds):
                 batch, pending = pending[:self.batch_size], pending[self.batch_size:]
+                if self.profile_folder:
+                    batch_start = time.perf_counter()
                 states = torch.from_numpy(np.stack([state for _, state in batch])).to(device)
+                if cuda_timing:
+                    forward_start.record()
                 logits, values = model(states)
+                if cuda_timing:
+                    forward_end.record()
                 logits, values = logits.cpu().numpy(), values.cpu().numpy()
+                if self.profile_folder:
+                    inference_seconds += time.perf_counter() - batch_start
+                if cuda_timing:
+                    cuda_forward_ms += forward_start.elapsed_time(forward_end)
                 for (connection, _), policy, value in zip(batch, logits, values):
                     connection.send((policy, float(value)))
                 batches += 1
@@ -142,7 +175,12 @@ class ParallelSelfPlay:
             if time.monotonic() - last_activity > 180:
                 raise RuntimeError('Self-play stalled for 180 seconds; stopping workers')
         # Stable replay order despite asynchronous execution.
-        return [results[i] for i in range(games)], {
+        metrics = {
             'inference_batches': batches, 'inference_positions': requests,
             'inference_mean_batch': requests / max(1, batches), 'inference_max_batch': max_batch,
         }
+        if self.profile_folder:
+            metrics.update(parent_wait_seconds=wait_seconds, inference_wall_seconds=inference_seconds)
+            if cuda_timing:
+                metrics['cuda_forward_seconds'] = cuda_forward_ms / 1000
+        return [results[i] for i in range(games)], metrics

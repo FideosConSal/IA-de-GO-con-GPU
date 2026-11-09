@@ -37,6 +37,7 @@ def parser(default_mode='atari'):
     p.add_argument('--reset-value', action='store_true', help='Reset value head and its optimizer state; requires a new output')
     p.add_argument('--clear-replay', action='store_true', help='Discard old replay on resume; requires a new output')
     p.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    p.add_argument('--profile', action='store_true', help='Write phase timings and function profiles inside the output run')
     p.add_argument('--iterations', type=int, default=100, help='Total, including resumed iterations')
     p.add_argument('--additional-iterations', type=int, help='Run this many iterations after the loaded checkpoint')
     p.add_argument('--hours', type=float, default=0, help='Soft time budget per invocation; 0 disables')
@@ -174,11 +175,24 @@ def main(default_mode='atari'):
           'Ctrl+C resumes from the last saved checkpoint.', flush=True)
     last_saved_iteration = iteration
     pool = None
+    profiler = profile_folder = None
+    if args.profile:
+        import cProfile
+        import tempfile
+        from collections import Counter
+        from training_profile import save_profile
+        profile_folder = Path(tempfile.mkdtemp(prefix='profile-', dir=args.output))
+        print(f'Profiling: {profile_folder.resolve()}', flush=True)
+        totals = Counter()
+        measured_iterations = 0
+        profile_started = time.perf_counter()
+        profiler = cProfile.Profile()
+        profiler.enable()
     try:
         if args.workers > 1:
             from parallel_selfplay import ParallelSelfPlay
             pool = ParallelSelfPlay(min(args.workers, args.games_per_iteration),
-                                    args.inference_batch_size, args.batch_wait_ms)
+                                    args.inference_batch_size, args.batch_wait_ms, profile_folder)
         while iteration < args.iterations:
             if args.hours and time.perf_counter() - started >= args.hours * 3600:
                 break
@@ -208,16 +222,24 @@ def main(default_mode='atari'):
                 print(f'Iteration {iteration + 1}: game {game + 1}/{args.games_per_iteration}, '
                       f'{len(samples)} moves', flush=True)
             play_seconds = time.perf_counter() - round_start
+            if profiler:
+                phase_start = time.perf_counter()
             metrics = train_steps(model, optimizer, replay, rng, device,
                                   args.train_steps, args.batch_size)
+            if profiler:
+                metrics['training_seconds'] = time.perf_counter() - phase_start
             metrics.update(inference_metrics)
             metrics.update(runtime)
             iteration += 1
             if iteration % args.eval_every == 0:
+                if profiler:
+                    phase_start = time.perf_counter()
                 metrics['random_win_rate'] = evaluate(model, device, args.size,
                     args.simulations, args.eval_games, args.seed + 100000, args.initial_position, **game_options)
                 if args.game_mode == 'atari':
                     metrics.update(tactical_metrics(model, device, args.size, args.simulations))
+                if profiler:
+                    metrics['evaluation_seconds'] = time.perf_counter() - phase_start
             if args.game_mode == 'standard':
                 metrics.update(
                     move_limit_rate=sum(s.get('reason') == 'move_limit' for s in game_stats)/len(game_stats),
@@ -235,12 +257,23 @@ def main(default_mode='atari'):
                            games_per_hour=args.games_per_iteration * 3600 / play_seconds,
                            iteration_seconds=time.perf_counter() - round_start,
                            elapsed_seconds=elapsed)
+            if profiler:
+                phase_start = time.perf_counter()
             if iteration % args.checkpoint_every == 0:
                 save_checkpoint(latest, model, optimizer, replay, rng, config, iteration, elapsed)
                 last_saved_iteration = iteration
             if iteration % args.eval_every == 0:
                 torch.save({'config': config, 'model': model.state_dict(), 'iteration': iteration},
                            args.output / f'model_{iteration:05d}.pt')
+            if profiler:
+                metrics['checkpoint_seconds'] = (time.perf_counter() - phase_start if
+                    iteration % args.checkpoint_every == 0 or iteration % args.eval_every == 0 else 0.0)
+                for key in ('self_play_seconds', 'training_seconds', 'evaluation_seconds', 'checkpoint_seconds',
+                            'parent_wait_seconds', 'inference_wall_seconds', 'cuda_forward_seconds',
+                            'positions', 'inference_batches', 'inference_positions'):
+                    if key in metrics:
+                        totals[key] += metrics[key]
+                measured_iterations += 1
             with (args.output / 'metrics.jsonl').open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps(metrics) + '\n')
             print(json.dumps(metrics), flush=True)
@@ -248,13 +281,26 @@ def main(default_mode='atari'):
         # after Ctrl+C during self-play or an optimizer step.
         if iteration != last_saved_iteration:
             elapsed = previous_elapsed + time.perf_counter() - started
+            if profiler:
+                phase_start = time.perf_counter()
             save_checkpoint(latest, model, optimizer, replay, rng, config, iteration, elapsed)
+            if profiler:
+                totals['checkpoint_seconds'] += time.perf_counter() - phase_start
     except KeyboardInterrupt:
         print(f'\nInterrupted. Resume from saved iteration {last_saved_iteration}; '
               'unsaved work is discarded.', flush=True)
     finally:
         if pool is not None:
             pool.close()
+        if profiler:
+            profiler.disable()
+            wall = time.perf_counter() - profile_started
+            save_profile(profiler, profile_folder, 'parent_wall')
+            phases = {k: totals[k] for k in ('self_play_seconds', 'training_seconds', 'evaluation_seconds', 'checkpoint_seconds')}
+            report = dict(iterations=measured_iterations, config=config, runtime=runtime, wall_seconds=wall,
+                          phase_percent={k: round(100*v/wall, 2) for k,v in phases.items()}, totals=dict(totals))
+            (profile_folder / 'summary.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
+            print(f'Profile phases (% wall): {report["phase_percent"]}', flush=True)
     print(f'Checkpoint: {latest.resolve()}', flush=True)
 
 
