@@ -33,7 +33,11 @@ def parser(default_mode='atari'):
     p.set_defaults(game_mode=default_mode)
     p.add_argument('--komi', type=float, default=7.5)
     p.add_argument('--max-moves', type=int, default=0, help='Standard Go: area adjudication limit; 0 chooses 4*size*size')
-    p.add_argument('--resume', type=Path, help='Resume into the checkpoint directory')
+    start = p.add_mutually_exclusive_group()
+    start.add_argument('--resume', type=Path, help='Resume into the checkpoint directory')
+    if default_mode == 'standard':
+        start.add_argument('--init-from-atari', type=Path,
+                           help='Start a fresh Go run with compatible Atari weights')
     p.add_argument('--reset-value', action='store_true', help='Reset value head and its optimizer state; requires a new output')
     p.add_argument('--clear-replay', action='store_true', help='Discard old replay on resume; requires a new output')
     p.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
@@ -76,6 +80,20 @@ def main(default_mode='atari'):
                    'train_steps', 'batch_size', 'buffer_size', 'learning_rate', 'seed',
                    'eval_every', 'eval_games', 'initial_position', 'game_mode', 'komi', 'max_moves')
     checkpoint = None
+    transfer = None
+    if getattr(args, 'init_from_atari', None):
+        source = torch.load(args.init_from_atari, map_location='cpu', weights_only=True)
+        src_config = source['config']
+        if src_config.get('game_mode', 'atari') != 'atari':
+            p.error('--init-from-atari requires an Atari checkpoint')
+        for key in ('channels', 'blocks'):
+            if '--' + key in explicit and getattr(args, key) != src_config[key]:
+                p.error(f'{key} must match the Atari architecture')
+            setattr(args, key, src_config[key])
+        transfer = source['model']
+        provenance = dict(source=str(args.init_from_atari.resolve()),
+                          source_iteration=source.get('iteration'), source_size=src_config['size'])
+        del source
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu', weights_only=True)
         if checkpoint['version'] != 1:
@@ -126,11 +144,30 @@ def main(default_mode='atari'):
     torch.manual_seed(args.seed)
     rng = np.random.default_rng(args.seed)
     model = PolicyValueNet(args.channels, args.blocks, args.game_mode).to(device)
+    if transfer is not None:
+        # Validate the source strictly, including old checkpoints with no mode field.
+        dest = model.state_dict()
+        shared = {k for k in dest if not k.startswith('pass_policy.')}
+        if set(transfer) != shared:
+            p.error('Atari checkpoint has incompatible model layers')
+        first = 'body.0.weight'
+        expanded = torch.zeros_like(dest[first], device='cpu')
+        if expanded[:, :6].shape != transfer[first].shape:
+            p.error('Atari checkpoint has incompatible input weights')
+        expanded[:, :6].copy_(transfer[first])
+        dest.update(transfer)
+        dest[first] = expanded
+        model.load_state_dict(dest)
+        del transfer, dest
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     replay = deque(maxlen=args.buffer_size)
     iteration, previous_elapsed = 0, 0.0
     config = {key: getattr(args, key) for key in config_keys}
     config['value_objective'] = 'bce_logits_smoothing_0.02'
+    if getattr(args, 'init_from_atari', None):
+        config['initialized_from_atari'] = provenance
+    elif checkpoint and 'initialized_from_atari' in checkpoint['config']:
+        config['initialized_from_atari'] = checkpoint['config']['initialized_from_atari']
     if checkpoint:
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])

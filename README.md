@@ -1,5 +1,20 @@
 # Go RL Baseline
 
+## Transferir un modelo de Atari Go a Go estándar
+
+```powershell
+python train_go.py --init-from-atari runs/atari9_central3/latest.pt --size 9 --device cuda --workers 40 --games-per-iteration 80 --hours 2 --iterations 100000 --output runs/go9_desde_atari
+```
+
+Acepta tanto `latest.pt` como un histórico `model_XXXXX.pt`. La carpeta de
+destino debe ser nueva o vacía. Se copian las seis entradas comunes, el cuerpo
+residual y las salidas de política de tablero y valor. Los pesos de las tres
+entradas nuevas empiezan en cero, y la salida de pase se inicializa como en
+una red nueva. Todos los pesos se siguen entrenando. El modelo hereda canales
+y bloques; el tamaño de destino se elige con `--size` y puede ser diferente.
+El optimizador, el buffer y el contador empiezan de cero. Para continuar luego,
+usar `train_go.py --resume runs/go9_desde_atari/latest.pt`.
+
 Para entrenar **Go estándar** (pases, conteo de área y komi), ver
 [GO_ESTANDAR.md](GO_ESTANDAR.md). Se inicia con `python train_go.py`.
 
@@ -176,11 +191,11 @@ partidas evaluadas, no la variabilidad entre entrenamientos independientes.
 Las evaluaciones periódicas usan una semilla fija; usar semillas nuevas para
 la evaluación final. Ganar al azar no demuestra fuerza contra otros agentes.
 
-El entrenador solo admite Atari Go (sin pase). Al terminar la primera captura,
+En Atari Go no se permite pasar. Al terminar la primera captura,
 cada posición recibe +1 o -1 desde la perspectiva del jugador que debía mover.
 Como no hay capturas anteriores al final, las partidas duran a lo sumo N²
-jugadas. La red acepta otros tamaños con `--size`, pero todavía no implementamos
-la transferencia a Go estándar, su acción de pase ni entrenamiento distribuido.
+jugadas. En Go estándar se permite pasar; para transferir un modelo Atari
+al entrenador estándar, ver el ejemplo al inicio del documento.
 
 Archivos nuevos: `az_atari.py` (red y aprendizaje), `train_atari.py` (CLI y
 checkpoints), `evaluate_atari.py` (partidas comparativas), `test_training.py`.
